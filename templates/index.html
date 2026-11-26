@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>再生纸厂收料回测 · 错收 / 漏收对比</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="wrap">
+    <h1>再生纸厂 · 两种收料判级回测</h1>
+    <p class="subtitle">
+      上传入厂 CSV 与化验回单 CSV，按“有记录的分钟”回放：同一分钟先判级、后处理回单。
+      两套最近质心分类器同源于内置标注样本，<strong>固定模型</strong>永不更新，
+      <strong>自适应模型</strong>随回单增量更新；距离相等时判<strong>不合格</strong>。
+    </p>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- ================= 1. 上传 ================= -->
+  <section class="card" id="upload">
+    <h2><span class="step-no">1</span>上传 CSV / 载入样例</h2>
+
+    {% if error %}
+    <div id="upload-error" class="alert alert-error" role="alert" data-error="{{ error }}">
+      <strong>操作失败：</strong>{{ error }}
+      <div class="muted">当前回放保持不变，可继续单步或跑完。</div>
+    </div>
+    {% endif %}
+    {% if notice %}
+    <div id="notice" class="alert alert-ok" role="status">{{ notice }}</div>
+    {% endif %}
+
+    <div class="upload-grid">
+      <form id="upload-form" action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
+        <div class="file-row">
+          <label class="file-pick">
+            <span class="file-label">入厂 CSV（批号 / 入厂分钟 / 含水率 / 白度）</span>
+            <input type="file" name="inbound" id="input-inbound" accept=".csv,text/csv">
+            <span class="file-name" data-for="input-inbound">未选择文件</span>
+          </label>
+          <label class="file-pick">
+            <span class="file-label">化验 CSV（批号 / 出单分钟 / 合格与否）</span>
+            <input type="file" name="lab" id="input-lab" accept=".csv,text/csv">
+            <span class="file-name" data-for="input-lab">未选择文件</span>
+          </label>
+        </div>
+        <div class="btn-row">
+          <button type="submit" id="btn-upload" class="btn btn-primary">上传并开始回测</button>
+        </div>
+        <p class="hint">
+          同批同分钟限一张回单；同一批号可在不同分钟收到“改判”回单。
+          上传的两份文件会一起校验，任一不合格都不会影响页面上已有的回放。
+        </p>
+      </form>
+
+      <div class="sample-box">
+        <h3>没有数据？直接试样例</h3>
+        <form action="/sample/demo" method="post">
+          <button type="submit" id="btn-load-demo" class="btn btn-accent">载入演示样例（可演示改判）</button>
+        </form>
+        <form action="/sample/tie" method="post">
+          <button type="submit" id="btn-load-tie" class="btn">载入“等距判不合格”样例</button>
+        </form>
+        <div class="sample-links">
+          <a href="/samples/demo_inbound.csv" download>演示·入厂 CSV</a>
+          <a href="/samples/demo_lab.csv" download>演示·化验 CSV</a>
+          <a href="/samples/tie_inbound.csv" download>等距·入厂 CSV</a>
+          <a href="/samples/tie_lab.csv" download>等距·化验 CSV</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  {% if not state %}
+  <section class="card empty-state" id="empty-state" data-loaded="false">
+    <h2>尚未载入回测数据</h2>
+    <p>上传两份 CSV，或点击“载入演示样例（可演示改判）”，然后即可逐分钟回放。</p>
+    <p class="muted">
+      CSV 表头示例：<code>批号,入厂分钟,含水率,白度</code> 与
+      <code>批号,出单分钟,合格与否</code>（兼容常见英文表头与 UTF-8 / GBK 编码）。
+    </p>
+  </section>
+  {% endif %}
+
+  <!-- ================= 2. 回放控制 ================= -->
+  <section class="card" id="workspace" data-loaded="{{ 'true' if state else 'false' }}">
+    <div class="playback-head">
+      <h2><span class="step-no">2</span>分钟回放</h2>
+      <div id="minute-progress"
+           data-played="{{ state.played_minute_count if state else 0 }}"
+           data-total="{{ state.total_minute_count if state else 0 }}"
+           data-current="{{ state.current_minute if state and state.current_minute is not none else '' }}"
+           data-next="{{ state.next_minute if state and state.next_minute is not none else '' }}"
+           data-done="{{ 'true' if state and state.done else 'false' }}">
+        {% if not state %}
+          尚未载入数据
+        {% elif state.played_minute_count == 0 %}
+          尚未开始 · 共 <strong>{{ state.total_minute_count }}</strong> 个有记录的分钟
+        {% else %}
+          已回放 <strong>{{ state.played_minute_count }}</strong>/{{ state.total_minute_count }} 个记录分钟
+          · 当前分钟 <strong id="current-minute">{{ state.current_minute }}</strong>
+          {% if state.done %}
+            <span class="badge badge-done" id="done-badge">已全部跑完</span>
+          {% else %}
+            · 下一分钟 <strong>{{ state.next_minute }}</strong>
+          {% endif %}
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="btn-row playback-actions">
+      <form action="/step" method="post">
+        <button type="submit" id="btn-step" class="btn btn-primary"
+                {% if not state or state.done %}disabled aria-disabled="true"{% endif %}>⏭ 单步推进到下一记录分钟</button>
+      </form>
+      <form action="/run" method="post">
+        <button type="submit" id="btn-run" class="btn btn-success"
+                {% if not state or state.done %}disabled aria-disabled="true"{% endif %}>⏩ 直接跑完</button>
+      </form>
+      <form action="/reset" method="post">
+        <button type="submit" id="btn-reset" class="btn btn-ghost"
+                {% if not state %}disabled aria-disabled="true"{% endif %}>↺ 重置回放</button>
+      </form>
+      {% if state %}
+      <span class="file-meta muted">
+        当前数据：{{ state.dataset.inbound_name }}（{{ state.dataset.inbound_count }} 批） ·
+        {{ state.dataset.lab_name }}（{{ state.dataset.lab_count }} 张回单）
+        {% if sample_case %}· 内置样例 {{ sample_case }}{% endif %}
+      </span>
+      {% endif %}
+    </div>
+  </section>
+
+  {% if state %}
+  <!-- ================= 3. 错收 / 漏收 ================= -->
+  <section class="card" id="results">
+    <h2><span class="step-no">3</span>错收 / 漏收批号（按已回放的最新回单）</h2>
+
+    <div class="lists-grid">
+      {% for model_key, model_title in [("fixed", "固定模型（不更新）"), ("adaptive", "自适应模型（随回单更新）")] %}
+        {% for err_key, err_title, err_cls in [
+              ("wrong_accept", "错收（判合格·实不合格）", "wa"),
+              ("wrong_reject", "漏收（判不合格·实合格）", "wr")] %}
+        {% set batches = state.lists[model_key][err_key] %}
+        <div class="list-card {{ err_cls }}"
+             id="list-{{ model_key }}-{{ err_key|replace('_','-') }}"
+             data-testid="{{ model_key }}-{{ err_key|replace('_','-') }}"
+             data-model="{{ model_key }}" data-error="{{ err_key }}"
+             data-count="{{ batches|length }}">
+          <h3>
+            <span class="list-title">{{ model_title }} · {{ err_title }}</span>
+            <span class="count-pill" data-role="count">{{ batches|length }}</span>
+          </h3>
+          {% if batches %}
+          <ul class="batch-chips">
+            {% for b in batches %}
+            <li class="batch-id" data-batch="{{ b }}">{{ b }}</li>
+            {% endfor %}
+          </ul>
+          {% else %}
+          <p class="list-empty" data-role="empty">无</p>
+          {% endif %}
+        </div>
+        {% endfor %}
+      {% endfor %}
+    </div>
+
+    <div class="score-row">
+      {% for model_key, model_title in [("fixed", "固定模型"), ("adaptive", "自适应模型")] %}
+      <div class="score-card score-{{ model_key }}">
+        <strong>{{ model_title }}</strong>
+        <span class="score-item wa">错收 <b id="count-{{ model_key }}-wa">{{ state.counts[model_key].wrong_accept }}</b></span>
+        <span class="score-item wr">漏收 <b id="count-{{ model_key }}-wr">{{ state.counts[model_key].wrong_reject }}</b></span>
+        <span class="score-item ok">判对 <b>{{ state.counts[model_key].correct }}</b></span>
+        <span class="score-item pending">待回单 <b>{{ state.counts[model_key].pending }}</b></span>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <!-- ================= 4. 图 + 质心 ================= -->
+  <section class="grid-2">
+    <div class="card">
+      <h2>特征空间与质心</h2>
+      <div id="scatter-wrap">
+        <svg id="scatter" viewBox="0 0 520 420" role="img" aria-label="含水率-白度散点图"></svg>
+        <div id="scatter-legend" class="legend">
+          <span><i class="dot seed-q"></i>内置合格样本</span>
+          <span><i class="dot seed-b"></i>内置不合格样本</span>
+          <span><i class="dot batch"></i>入厂批次</span>
+          <span><i class="cross cq"></i>合格质心</span>
+          <span><i class="cross cb"></i>不合格质心</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>两套质心（实时）</h2>
+      <table class="centroid-table" id="centroid-table">
+        <thead><tr><th>模型 / 类别</th><th>含水率质心</th><th>白度质心</th><th>样本数</th></tr></thead>
+        <tbody>
+        {% for model_key, model_title in [("fixed", "固定模型"), ("adaptive", "自适应模型")] %}
+          {% set m = state.models[model_key] %}
+          <tr class="model-head"><td colspan="4">{{ model_title }}{% if model_key == "adaptive" %} · 已应用 {{ m.receipts_applied }} 张回单（{{ m.distinct_receipt_batches }} 批，单张 O(1) 更新）{% endif %}</td></tr>
+          <tr>
+            <td><span class="tag tag-q">合格</span></td>
+            <td>{{ "%.4f"|format(m.centroids.qualified[0]) }}</td>
+            <td>{{ "%.4f"|format(m.centroids.qualified[1]) }}</td>
+            <td>{{ m.counts.qualified }}</td>
+          </tr>
+          <tr>
+            <td><span class="tag tag-b">不合格</span></td>
+            <td>{{ "%.4f"|format(m.centroids.unqualified[0]) }}</td>
+            <td>{{ "%.4f"|format(m.centroids.unqualified[1]) }}</td>
+            <td>{{ m.counts.unqualified }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      <p class="hint">虚线为固定模型等距分界线，实线为自适应模型当前等距分界线；正好落在线上的点判不合格。</p>
+    </div>
+  </section>
+
+  <!-- ================= 5. 批次明细表 ================= -->
+  <section class="card">
+    <h2>各批入厂判级与最新回单</h2>
+    <div class="table-scroll">
+      <table id="batch-table" class="batch-table">
+        <thead>
+        <tr>
+          <th>批号</th><th>入厂分钟</th><th>含水率</th><th>白度</th>
+          <th>固定判级</th><th>自适应判级</th>
+          <th>最新回单</th><th>固定对账</th><th>自适应对账</th>
+        </tr>
+        </thead>
+        <tbody>
+        {% for b in state.batches %}
+        {% set row_err = b.error_adaptive if b.error_adaptive else b.error_fixed %}
+        <tr data-batch="{{ b.batch }}" class="row-{{ row_err or 'ok' }} {{ 'row-corrected' if b.receipt and b.receipt.revised else '' }}">
+          <td class="batch-id" data-batch="{{ b.batch }}"><strong>{{ b.batch }}</strong></td>
+          <td>{{ b.minute }}</td>
+          <td>{{ b.moisture }}</td>
+          <td>{{ b.whiteness }}</td>
+          <td>
+            {% if b.pred_fixed %}
+              <span class="verdict verdict-{{ b.pred_fixed.label_name }}">
+                {{ b.pred_fixed.label_cn }}{% if b.pred_fixed.tie %}<em class="tie">等距→不合格</em>{% endif %}
+              </span>
+            {% else %}<span class="muted">本分钟未回放</span>{% endif %}
+          </td>
+          <td>
+            {% if b.pred_adaptive %}
+              <span class="verdict verdict-{{ b.pred_adaptive.label_name }}">
+                {{ b.pred_adaptive.label_cn }}{% if b.pred_adaptive.tie %}<em class="tie">等距→不合格</em>{% endif %}
+              </span>
+            {% else %}<span class="muted">本分钟未回放</span>{% endif %}
+          </td>
+          <td>
+            {% if b.receipt %}
+              第{{ b.receipt.minute }}分钟
+              <span class="verdict verdict-{{ 'qualified' if b.receipt.qualified == 1 else 'unqualified' }}">{{ b.receipt.label_cn }}</span>
+              {% if b.receipt.revised %}<span class="badge badge-correction correction-badge" data-batch="{{ b.batch }}">改判</span>{% endif %}
+              {% if b.receipt_history|length > 1 %}
+              <div class="history muted">
+                {% for h in b.receipt_history %}
+                  <span>{{ h.minute }}′:{{ h.label_cn }}</span>{% if not loop.last %} → {% endif %}
+                {% endfor %}
+              </div>
+              {% endif %}
+            {% else %}<span class="muted">暂无已回放回单</span>{% endif %}
+          </td>
+          <td>
+            {% if b.error_fixed == 'wrong_accept' %}<span class="err wa">错收</span>
+            {% elif b.error_fixed == 'wrong_reject' %}<span class="err wr">漏收</span>
+            {% elif b.receipt %}<span class="err ok">一致</span>
+            {% else %}<span class="muted">—</span>{% endif %}
+          </td>
+          <td>
+            {% if b.error_adaptive == 'wrong_accept' %}<span class="err wa">错收</span>
+            {% elif b.error_adaptive == 'wrong_reject' %}<span class="err wr">漏收</span>
+            {% elif b.receipt %}<span class="err ok">一致</span>
+            {% else %}<span class="muted">—</span>{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ================= 6. 时间线 ================= -->
+  <section class="card" id="timeline">
+    <h2>回放时间线（每分钟：先判级，后回单）</h2>
+    {% if state.minute_log %}
+    <ol class="timeline-list">
+      {% for block in state.minute_log|reverse %}
+      <li class="timeline-minute" data-minute="{{ block.minute }}">
+        <h3>第 {{ block.minute }} 分钟</h3>
+        {% if block.classifications %}
+        <div class="tl-classify">
+          <span class="tl-label">入厂判级：</span>
+          {% for c in block.classifications %}
+          <span class="tl-item" data-batch="{{ c.batch }}">
+            {{ c.batch }} → 固定<strong class="v-{{ c.fixed.label_name }}">{{ c.fixed.label_cn }}</strong>
+            / 自适应<strong class="v-{{ c.adaptive.label_name }}">{{ c.adaptive.label_cn }}</strong>
+            {% if c.adaptive.tie or c.fixed.tie %}<em class="tie">等距</em>{% endif %}
+          </span>
+          {% endfor %}
+        </div>
+        {% endif %}
+        {% if block.receipts %}
+        <div class="tl-receipts">
+          <span class="tl-label">处理回单：</span>
+          {% for r in block.receipts %}
+          <span class="tl-item receipt" data-batch="{{ r.batch }}">
+            {{ r.batch }} → <strong class="v-{{ 'qualified' if r.qualified == 1 else 'unqualified' }}">{{ r.label_cn }}</strong>
+            {% if r.correction %}
+              <span class="badge badge-correction correction-badge">改判：{{ r.previous_label_cn }}→{{ r.label_cn }}，已替换旧标签贡献</span>
+            {% endif %}
+          </span>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ol>
+    {% else %}
+    <p class="muted">尚未推进。点击“单步推进”或“直接跑完”开始。</p>
+    {% endif %}
+  </section>
+
+  <script id="state-json" type="application/json">{{ state|tojson }}</script>
+  <script>window.__STATE__ = JSON.parse(document.getElementById('state-json').textContent);</script>
+  {% endif %}
+</main>
+
+<footer class="footer wrap">
+  <span>最近质心 · 增量求和质心 · 改判替换旧贡献 · 单张回单 O(1) 更新</span>
+</footer>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
